@@ -21,25 +21,28 @@ const fetchMovies = async (endpoint, cacheKey) => {
   const cachedMovies = cache.get(cacheKey);
   if (cachedMovies) return cachedMovies;
 
-  try {
-    const response = await axios.get(`${API_URL}/${endpoint}?site=yts&limit=50`, { timeout: 10000 });
-    const movies = response.data.data.filter(movie => movie.name && movie.poster && movie.rating);
-    cache.set(cacheKey, movies);
-    return movies;
-  } catch (error) {
-    console.error(`Error fetching ${cacheKey}:`, error);
-    return cachedMovies || [];
+  const MAX_RETRIES = 3;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      const response = await axios.get(`${API_URL}/${endpoint}?site=yts&limit=50`, { timeout: 30000 });
+      const movies = response.data.data.filter(movie => movie.name && movie.poster && movie.rating);
+      cache.set(cacheKey, movies);
+      return movies;
+    } catch (error) {
+      console.error(`Error fetching ${cacheKey} (Attempt ${attempt + 1}):`, error.message);
+      if (attempt === MAX_RETRIES - 1) return cachedMovies || [];
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
   }
 };
 
-// Background job to refresh cache every hour
+// Background job to refresh cache every day
 const refreshCache = async () => {
-    console.log("Refreshing movie cache...");
-    await fetchMovies("trending", "trending_movies");
-    await fetchMovies("recent", "recent_movies");
+  console.log("Refreshing movie cache...");
+  await fetchMovies("trending", "trending_movies");
+  await fetchMovies("recent", "recent_movies");
 };
 
-// Run cache refresh every 1 day
 setInterval(refreshCache, 24 * 60 * 60 * 1000);
 
 // API Endpoints
