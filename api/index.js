@@ -18,15 +18,18 @@ const API_URL = "https://torrent-fast-api.onrender.com/api/v1";
 
 // Fetch and cache movies
 const fetchMovies = async (endpoint, cacheKey) => {
-    try {
-        const response = await axios.get(`${API_URL}/${endpoint}?site=yts&limit=50`);
-        const movies = response.data.data.filter(movie => movie.name && movie.poster && movie.rating);
-        cache.set(cacheKey, movies);
-        return movies;
-    } catch (error) {
-        console.error(`Error fetching ${cacheKey}:`, error);
-        return cache.get(cacheKey) || []; // Return old data if API call fails
-    }
+  const cachedMovies = cache.get(cacheKey);
+  if (cachedMovies) return cachedMovies;
+
+  try {
+    const response = await axios.get(`${API_URL}/${endpoint}?site=yts&limit=50`, { timeout: 10000 });
+    const movies = response.data.data.filter(movie => movie.name && movie.poster && movie.rating);
+    cache.set(cacheKey, movies);
+    return movies;
+  } catch (error) {
+    console.error(`Error fetching ${cacheKey}:`, error);
+    return cachedMovies || [];
+  }
 };
 
 // Background job to refresh cache every hour
