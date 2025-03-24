@@ -8,7 +8,7 @@ import NodeCache from "node-cache";
 import axios from "axios";
 
 const app = express();
-const client = new WebTorrent();
+const client = new WebTorrent({ maxConns: 20 }); // Limit peers for better performance
 
 app.use(cors());
 app.use(express.json());
@@ -16,7 +16,7 @@ app.use(express.json());
 const cache = new NodeCache({ stdTTL: 86400 }); // Cache for 24 hours
 const API_URL = "https://torrent-fast-api.onrender.com/api/v1";
 
-// Fetch and cache movies
+// Fetch and cache movies with retries and timeouts
 const fetchMovies = async (endpoint, cacheKey) => {
   const cachedMovies = cache.get(cacheKey);
   if (cachedMovies) return cachedMovies;
@@ -24,79 +24,68 @@ const fetchMovies = async (endpoint, cacheKey) => {
   const MAX_RETRIES = 3;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      const response = await axios.get(`${API_URL}/${endpoint}?site=yts&limit=50`, { timeout: 30000 });
+      console.log(`Fetching: ${endpoint} (Attempt: ${attempt + 1})`);
+      const response = await axios.get(`${API_URL}/${endpoint}?site=yts&limit=50`, { timeout: 15000 });
       const movies = response.data.data.filter(movie => movie.name && movie.poster && movie.rating);
       cache.set(cacheKey, movies);
       return movies;
     } catch (error) {
       console.error(`Error fetching ${cacheKey} (Attempt ${attempt + 1}):`, error.message);
-      if (attempt === MAX_RETRIES - 1) return cachedMovies || [];
-      await new Promise((resolve) => setTimeout(resolve, 5000));
     }
   }
+  return cachedMovies || [];
 };
 
-// Background job to refresh cache every day
+// Background job to refresh cache every 24 hours
 const refreshCache = async () => {
   console.log("Refreshing movie cache...");
   await fetchMovies("trending", "trending_movies");
   await fetchMovies("recent", "recent_movies");
 };
-
 setInterval(refreshCache, 24 * 60 * 60 * 1000);
 
 // API Endpoints
 app.get("/movies/trending", async (req, res) => {
-    const movies = cache.get("trending_movies") || (await fetchMovies("trending", "trending_movies"));
-    res.json(movies);
+  const movies = cache.get("trending_movies") || (await fetchMovies("trending", "trending_movies"));
+  res.json(movies);
 });
 
 app.get("/movies/recent", async (req, res) => {
-    const movies = cache.get("recent_movies") || (await fetchMovies("recent", "recent_movies"));
-    res.json(movies);
+  const movies = cache.get("recent_movies") || (await fetchMovies("recent", "recent_movies"));
+  res.json(movies);
 });
 
 app.get("/movies/search", async (req, res) => {
-    const { query, page = 1 } = req.query;
-    if (!query) return res.status(400).json({ error: "Query is required!" });
+  const { query, page = 1 } = req.query;
+  if (!query) return res.status(400).json({ error: "Query is required!" });
 
-    const cacheKey = `search_${query}_${page}`;
-    if (cache.has(cacheKey)) return res.json(cache.get(cacheKey));
+  const cacheKey = `search_${query}_${page}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return res.json(cached);
 
-    try {
-        const response = await axios.get(`${API_URL}/search?site=yts&query=${query}&limit=10&page=${page}`);
-        const movies = response.data.data.filter(movie => movie.name && movie.poster && movie.rating);
-        cache.set(cacheKey, movies, 86400); // Cache search results for 24 hours
-        res.json(movies);
-    } catch (error) {
-        res.status(500).json({ error: "Error fetching search results." });
-    }
+  try {
+    const response = await axios.get(`${API_URL}/search?site=yts&query=${query}&limit=10&page=${page}`, { timeout: 15000 });
+    const movies = response.data.data.filter(movie => movie.name && movie.poster && movie.rating);
+    cache.set(cacheKey, movies, 86400);
+    res.json(movies);
+  } catch (error) {
+    console.error("Search error:", error.message);
+    res.status(500).json({ error: "Error fetching search results." });
+  }
 });
 
-app.get("/movies/all", async (req, res) => {
-    const { query } = req.query;
-    if (!query) return res.status(400).json({ error: "Query is required!" });
+// Helper to extract infoHash from magnet link
+function extractInfoHash(magnet) {
+  const match = magnet.match(/urn:btih:([a-fA-F0-9]{40})/);
+  return match ? match[1].toLowerCase() : null;
+}
 
-    const cacheKey = `all_search_${query}`;
-    if (cache.has(cacheKey)) return res.json(cache.get(cacheKey));
-
-    try {
-        const response = await axios.get(`${API_URL}/all/search?query=${query}&limit=0`);
-        const movies = response.data.data.filter(movie => movie.name && movie.poster); // Removed movie.rating check
-        cache.set(cacheKey, movies, 86400);
-        res.json(movies);
-    } catch (error) {
-        res.status(500).json({ error: "Error fetching all search results." });
-    }
-});
-// Endpoint to list files in the torrent (videos, images & inside ZIPs)
+// Endpoint to list files in the torrent
 app.get('/list-files/:magnet', (req, res) => {
   const magnet = req.params.magnet;
   const infoHash = extractInfoHash(magnet);
 
-  if (!infoHash) {
-    return res.status(400).send('Invalid magnet link');
-  }
+  if (!infoHash) return res.status(400).send('Invalid magnet link');
 
   const existingTorrent = client.torrents.find((torrent) => torrent.infoHash === infoHash);
 
@@ -109,72 +98,14 @@ app.get('/list-files/:magnet', (req, res) => {
   });
 });
 
-// Helper to extract infoHash from magnet link
-function extractInfoHash(magnet) {
-  const match = magnet.match(/urn:btih:([a-fA-F0-9]{40})/);
-  return match ? match[1].toLowerCase() : null;
-}
-
-// Helper to get video and image files (including inside ZIP)
+// Helper to get video and image files
 async function getFiles(torrent) {
-  let fileList = [];
-
-  for (const file of torrent.files) {
-    if (getFileType(file.name) === 'zip') {
-      const extractedFiles = await extractZip(file);
-      fileList = fileList.concat(extractedFiles);
-    } else {
-      fileList.push({
-        name: file.name,
-        length: file.length,
-        path: file.path,
-        type: getFileType(file.name),
-      });
-    }
-  }
-
-  return fileList;
-}
-
-// Extract ZIP files and return list of video/image files inside
-function extractZip(zipFile) {
-  return new Promise((resolve, reject) => {
-    const extractedFiles = [];
-
-    zipFile.createReadStream((err, stream) => {
-      if (err) return reject(err);
-
-      let buffer = Buffer.alloc(0);
-
-      stream.on('data', (chunk) => {
-        buffer = Buffer.concat([buffer, chunk]);
-      });
-
-      stream.on('end', () => {
-        yauzl.fromBuffer(buffer, { lazyEntries: true }, (err, zip) => {
-          if (err) return reject(err);
-
-          zip.readEntry();
-          zip.on('entry', (entry) => {
-            if (!entry.fileName.endsWith('/')) {
-              const fileType = getFileType(entry.fileName);
-              if (fileType === 'video' || fileType === 'image') {
-                extractedFiles.push({
-                  name: entry.fileName,
-                  length: entry.uncompressedSize,
-                  path: zipFile.path + '/' + entry.fileName,
-                  type: fileType,
-                });
-              }
-            }
-            zip.readEntry();
-          });
-
-          zip.on('end', () => resolve(extractedFiles));
-        });
-      });
-    });
-  });
+  return torrent.files.map(file => ({
+    name: file.name,
+    length: file.length,
+    path: file.path,
+    type: getFileType(file.name),
+  })).filter(file => file.type === 'video' || file.type === 'image');
 }
 
 // Determine file type
@@ -182,7 +113,6 @@ function getFileType(fileName) {
   const ext = path.extname(fileName).toLowerCase();
   if (['.mp4', '.mkv', '.avi'].includes(ext)) return 'video';
   if (['.jpg', '.jpeg', '.png', '.gif'].includes(ext)) return 'image';
-  if (ext === '.zip') return 'zip';
   return 'other';
 }
 
@@ -191,58 +121,28 @@ app.get('/stream/:magnet/:filename', (req, res) => {
   const { magnet, filename } = req.params;
   const infoHash = extractInfoHash(magnet);
 
-  if (!infoHash) {
-    return res.status(400).send('Invalid magnet link');
-  }
+  if (!infoHash) return res.status(400).send('Invalid magnet link');
 
   const torrent = client.torrents.find((t) => t.infoHash === infoHash);
-  if (!torrent) {
-    return res.status(404).send('Torrent not found');
-  }
+  if (!torrent) return res.status(404).send('Torrent not found');
 
   const file = torrent.files.find((f) => f.name === filename);
-  if (!file) {
-    return res.status(404).send('File not found');
-  }
+  if (!file) return res.status(404).send('File not found');
 
-  if (getFileType(file.name) === 'video') {
-    const range = req.headers.range;
-    if (!range) {
-      return res.status(400).send('Requires Range header');
-    }
+  const range = req.headers.range;
+  if (!range) return res.status(400).send('Requires Range header');
 
-    const fileSize = file.length;
-    const [start, end] = range.replace(/bytes=/, '').split('-').map(Number);
-    const chunkEnd = end || Math.min(start + 10 ** 6, fileSize - 1);
-    const contentLength = chunkEnd - start + 1;
+  const [start, end] = range.replace(/bytes=/, '').split('-').map(Number);
+  const chunkEnd = end || Math.min(start + 10 ** 6, file.length - 1);
 
-    res.writeHead(206, {
-      'Content-Range': `bytes ${start}-${chunkEnd}/${fileSize}`,
-      'Accept-Ranges': 'bytes',
-      'Content-Length': contentLength,
-      'Content-Type': 'video/mp4',
-    });
+  res.writeHead(206, {
+    'Content-Range': `bytes ${start}-${chunkEnd}/${file.length}`,
+    'Accept-Ranges': 'bytes',
+    'Content-Length': chunkEnd - start + 1,
+    'Content-Type': 'video/mp4',
+  });
 
-    const stream = file.createReadStream({ start, end: chunkEnd });
-
-    stream.on('error', (err) => {
-      console.error('Stream error:', err);
-      if (!res.headersSent) {
-        res.status(500).end();
-      }
-    });
-
-    res.on('close', () => {
-      console.log('Client disconnected, stopping stream.');
-      stream.destroy();
-    });
-
-    return stream.pipe(res);
-  }
-
-  // Serve images directly
-  res.setHeader('Content-Type', `image/${path.extname(file.name).substring(1)}`);
-  file.createReadStream().pipe(res);
+  file.createReadStream({ start, end: chunkEnd }).pipe(res);
 });
 
 // Start the server
