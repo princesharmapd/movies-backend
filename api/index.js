@@ -38,7 +38,22 @@ const refreshCache = async () => {
 
 // Run cache refresh every 1 day
 setInterval(refreshCache, 24 * 60 * 60 * 1000);
+const keepAlive = () => {
+  setInterval(async () => {
+    try {
+      await axios.get(`https://torrent-fast-api.onrender.com/health`);
+      console.log("Health check: Server is alive");
+    } catch (error) {
+      console.error("Health check failed:", error.message);
+    }
+  }, 5 * 60 * 1000); // Every 5 minutes
+};
 
+keepAlive();
+
+app.get("/health", (req, res) => {
+  res.status(200).send("OK");
+});
 // API Endpoints
 app.get("/movies/trending", async (req, res) => {
     const movies = cache.get("trending_movies") || (await fetchMovies("trending", "trending_movies"));
